@@ -170,6 +170,10 @@ passport.serializeUser((user, done) => done(null, user.id));
 passport.deserializeUser((id, done) => User.findById(id).then(user => done(null, user || false)).catch(done));
 
 app.use(express.urlencoded({ extended: false }));
+app.use((req, res, next) => {
+  if (req.url === '/api' || req.url.startsWith('/api/')) req.url = req.url.slice(4) || '/';
+  next();
+});
 app.use(express.static('public'));
 app.use(session({
   name: 'sportzone.sid',
