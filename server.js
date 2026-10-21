@@ -17,13 +17,9 @@ const { renderAuthPage } = require('./views/authView');
 const app = express(), PER_PAGE = 10, PORT = process.env.PORT || 3000;
 const BASE = process.env.BASE_URL || `http://localhost:${PORT}`;
 const GOOGLE_ON = !!(process.env.GOOGLE_CLIENT_ID && process.env.GOOGLE_CLIENT_SECRET);
-if (!process.env.MONGODB_URI) {
-  console.error('Thiếu MONGODB_URI. Hãy điền connection string MongoDB Atlas trong file .env.');
-  process.exit(1);
-}
+if (!process.env.MONGODB_URI) throw new Error('Missing MONGODB_URI environment variable.');
 if (!process.env.SESSION_SECRET || process.env.SESSION_SECRET.length < 32) {
-  console.error('SESSION_SECRET phải có ít nhất 32 ký tự và được cấu hình trong file .env.');
-  process.exit(1);
+  throw new Error('SESSION_SECRET must contain at least 32 characters.');
 }
 const mongoConnection = mongoose.connect(process.env.MONGODB_URI);
 const sessionStore = MongoStore.create({
@@ -470,7 +466,7 @@ app.get('/auth/google', (req, res, next) => GOOGLE_ON
 app.get('/auth/google/callback', (req, res, next) => GOOGLE_ON
   ? passport.authenticate('google', { failureRedirect: '/' })(req, res, () => res.redirect('/'))
   : res.redirect('/'));
-if (!mongoConnection) {
+if (require.main === module) {
 mongoConnection
   .then(() => app.listen(PORT, () => console.log('Chạy tại ' + BASE)))
   .catch(() => {
@@ -478,3 +474,5 @@ mongoConnection
     process.exitCode = 1;
   });
 }
+
+module.exports = app;
