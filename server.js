@@ -1,17 +1,35 @@
 require('dotenv').config();
-const fs = require('fs'), crypto = require('crypto');
+const fs = require('fs');
 const express = require('express'), session = require('express-session');
 const passport = require('passport'), { Strategy } = require('passport-google-oauth20');
 const nodemailer = require('nodemailer');
+const mongoose = require('mongoose'), MongoStore = require('connect-mongo');
+const User = require('./models/userModel');
 const { CATS, products: PRODUCTS } = require('./models/productModel');
 const productModel = require('./models/productModel');
 const createProductController = require('./controllers/productController');
 const createProductView = require('./views/productView');
 const createProductRoutes = require('./routes/productRoutes');
+const createAuthController = require('./controllers/authController');
+const createAuthRoutes = require('./routes/authRoutes');
+const { renderAuthPage } = require('./views/authView');
 
 const app = express(), PER_PAGE = 10, PORT = process.env.PORT || 3000;
 const BASE = process.env.BASE_URL || `http://localhost:${PORT}`;
 const GOOGLE_ON = !!(process.env.GOOGLE_CLIENT_ID && process.env.GOOGLE_CLIENT_SECRET);
+if (!process.env.MONGODB_URI) {
+  console.error('Thiếu MONGODB_URI. Hãy điền connection string MongoDB Atlas trong file .env.');
+  process.exit(1);
+}
+if (!process.env.SESSION_SECRET || process.env.SESSION_SECRET.length < 32) {
+  console.error('SESSION_SECRET phải có ít nhất 32 ký tự và được cấu hình trong file .env.');
+  process.exit(1);
+}
+const mongoConnection = mongoose.connect(process.env.MONGODB_URI);
+const sessionStore = MongoStore.create({
+  clientPromise: mongoConnection.then(() => mongoose.connection.getClient()),
+  collectionName: 'sessions',
+});
 const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 const money = n => n.toLocaleString('vi-VN') + '₫';
 const Q = s => '/products?q=' + encodeURIComponent(s);
@@ -127,11 +145,6 @@ const MENU = [
   { t: 'Blog', h: '/blog' },
 ];
 
-// ---------- Người dùng ----------
-const UF = 'users.json';
-const users = fs.existsSync(UF) ? JSON.parse(fs.readFileSync(UF)) : {};
-const saveUsers = () => fs.writeFileSync(UF, JSON.stringify(users, null, 1));
-
 // ---------- Gửi mail ----------
 const mailer = nodemailer.createTransport({
   host: process.env.SMTP_HOST, port: +process.env.SMTP_PORT || 587, secure: process.env.SMTP_PORT == 465,
@@ -144,24 +157,37 @@ if (GOOGLE_ON) {
   passport.use(new Strategy({
     clientID: process.env.GOOGLE_CLIENT_ID, clientSecret: process.env.GOOGLE_CLIENT_SECRET,
     callbackURL: BASE + '/auth/google/callback',
-  }, (at, rt, p, done) => {
-    const u = { id: p.id, name: p.displayName, email: p.emails?.[0]?.value, avatar: p.photos?.[0]?.value };
-    if (!users[u.id]) {
-      users[u.id] = u; saveUsers();
-      if (u.email) sendMail({ to: u.email, subject: 'Chào mừng đến SportZone', html: `<p>Xin chào ${esc(u.name)}, cảm ơn bạn đã đăng ký tại SportZone!</p>` })
-        .catch(e => console.error('Gửi mail chào mừng lỗi:', e.message));
+  }, async (at, rt, profile, done) => {
+    try {
+      const { user, created } = await User.findOrCreateGoogle(profile);
+      if (created && user.email) sendMail({ to: user.email, subject: 'Chào mừng đến SportZone', html: `<p>Xin chào ${esc(user.name)}, cảm ơn bạn đã đăng ký tại SportZone!</p>` })
+        .catch(error => console.error('Gửi mail chào mừng lỗi:', error.message));
+      done(null, user);
+    } catch (error) {
+      done(error);
     }
-    done(null, u);
   }));
 } else {
   console.warn('Chưa có GOOGLE_CLIENT_ID / GOOGLE_CLIENT_SECRET trong .env: đăng nhập Google đang tắt.');
 }
-passport.serializeUser((u, d) => d(null, u.id));
-passport.deserializeUser((id, d) => d(null, users[id] || false));
+passport.serializeUser((user, done) => done(null, user.id));
+passport.deserializeUser((id, done) => User.findById(id).then(user => done(null, user || false)).catch(done));
 
 app.use(express.urlencoded({ extended: false }));
 app.use(express.static('public'));
-app.use(session({ secret: process.env.SESSION_SECRET || crypto.randomBytes(32).toString('hex'), resave: false, saveUninitialized: false, cookie: { httpOnly: true, sameSite: 'lax' } }));
+app.use(session({
+  name: 'sportzone.sid',
+  store: sessionStore,
+  secret: process.env.SESSION_SECRET,
+  resave: false,
+  saveUninitialized: false,
+  cookie: {
+    httpOnly: true,
+    sameSite: 'lax',
+    secure: process.env.NODE_ENV === 'production',
+    maxAge: 7 * 24 * 60 * 60 * 1000,
+  },
+}));
 app.use(passport.initialize());
 app.use(passport.session());
 
@@ -181,8 +207,8 @@ const layout = (req, title, body, full) => `<!doctype html><html lang="vi"><head
 <link rel="stylesheet" href="/style.css"></head><body>
 <div class="topbar"><div class="tl"><span>Hỗ trợ 24/7</span><span>Vận chuyển toàn quốc</span><span>Thanh toán tại nhà</span></div>
 <div class="tr"><span>Hotline: 1800 0000</span>${req.user
-    ? `<img class="ava" src="${esc(req.user.avatar)}" alt=""><a class="out" href="/logout">Đăng xuất</a>`
-    : `<a href="/auth/google">Đăng nhập</a><a href="/auth/google">Đăng ký</a>`}</div></div>
+    ? `${req.user.avatar ? `<img class="ava" src="${esc(req.user.avatar)}" alt="">` : esc(req.user.name)}<form method="post" action="/logout"><button class="out">Đăng xuất</button></form>`
+    : `<a href="/login">Đăng nhập</a><a href="/register">Đăng ký</a>`}</div></div>
 <header><a class="logo" href="/">SPORTZONE</a>
 <nav>${menuHtml}</nav>
 <form class="search" action="/products"><input name="q" placeholder="Tìm kiếm sản phẩm" aria-label="Tìm kiếm" value="${esc(req.query.q)}"><button aria-label="Tìm">${IC.search}</button></form>
@@ -198,6 +224,9 @@ ${full ? body : `<main>${body}</main>`}
 <script>document.querySelectorAll('.row').forEach(r=>{const ts=[...r.querySelectorAll('.tabs button')],ps=[...r.querySelectorAll('.panel')],bs=[...r.querySelectorAll('.arr button')];const tr=()=>[...r.querySelectorAll('.track')].find(x=>x.offsetParent);const upd=()=>{const t=tr();if(!t||bs.length<2)return;bs[0].disabled=t.scrollLeft<4;bs[1].disabled=t.scrollLeft+t.clientWidth>=t.scrollWidth-4};ts.forEach((b,i)=>b.onclick=()=>{ts.forEach(x=>x.classList.toggle('on',x===b));ps.forEach((p,j)=>p.hidden=j!==i);upd()});bs.forEach(b=>b.onclick=()=>{const t=tr();if(t)t.scrollBy({left:+b.dataset.d*t.clientWidth*.9,behavior:'smooth'})});r.addEventListener('scroll',upd,true);addEventListener('resize',upd);upd()})</script>
 <script>try{const c=JSON.parse(localStorage.sz_cart||'[]'),i=document.querySelector('.bag i');if(i)i.textContent=c.reduce((a,x)=>a+x.q,0)}catch(e){}</script>
 </body></html>`;
+
+const authController = createAuthController({ User, authView: { renderAuthPage: (req, mode) => renderAuthPage(layout, req, mode) } });
+app.use(createAuthRoutes(authController));
 
 const banner = b => `<div class="pbanner" style="--a:${b.c[0]};--b:${b.c[1]}"><span class="ghost" aria-hidden="true">${esc(b.g || b.name)}</span><div><p>${esc(b.k)}</p><h1>${esc(b.t || b.name)}</h1></div></div>`;
 const page = (req, title, b, inner) => layout(req, title, banner(b) + `<main>${inner}</main>`, true);
@@ -441,6 +470,11 @@ app.get('/auth/google', (req, res, next) => GOOGLE_ON
 app.get('/auth/google/callback', (req, res, next) => GOOGLE_ON
   ? passport.authenticate('google', { failureRedirect: '/' })(req, res, () => res.redirect('/'))
   : res.redirect('/'));
-app.get('/logout', (req, res, next) => req.logout(e => e ? next(e) : res.redirect('/')));
-
-app.listen(PORT, () => console.log('Chạy tại ' + BASE));
+if (!mongoConnection) {
+mongoConnection
+  .then(() => app.listen(PORT, () => console.log('Chạy tại ' + BASE)))
+  .catch(() => {
+    console.error('Không thể kết nối MongoDB. Hãy kiểm tra MONGODB_URI và quyền truy cập mạng của MongoDB Atlas.');
+    process.exitCode = 1;
+  });
+}
